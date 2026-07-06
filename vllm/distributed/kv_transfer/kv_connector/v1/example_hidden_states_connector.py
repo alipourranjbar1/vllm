@@ -520,7 +520,11 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         the hidden states from the KV cache.
         """
         req_id = request.request_id
-        filename = self._request_filenames.pop(req_id)
+        # Aborted/waiting requests may finish before build_connector_meta
+        # registers them (never scheduled under max-num-seqs pressure).
+        filename = self._request_filenames.pop(req_id, None)
+        if filename is None:
+            return False, None
         kv_params = request.kv_transfer_params or {}
         if kv_params.get("include_output_tokens", False):
             # Exclude the final token — it was the model's output, never an

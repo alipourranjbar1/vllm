@@ -1256,10 +1256,7 @@ def _use_packed_kv_cache_config(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> bool:
-    is_dsv4 = all(
-        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        for group in kv_cache_groups
-    )
+    is_dsv4 = _is_deepseek_v4_kv_groups(kv_cache_groups)
     kv_transfer_config = vllm_config.kv_transfer_config
     extra_config = (
         kv_transfer_config.kv_connector_extra_config
@@ -1694,6 +1691,49 @@ def _annotate_eagle_groups_deepseek_v4(
             break
 
 
+def _append_hidden_state_cache_groups(
+    groups: list[KVCacheGroupSpec],
+    hidden_specs: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Append extract_hidden_states layers as their own isolated KV groups.
+
+    Must stay separate from MLA / hybrid verifier groups so
+    ExampleHiddenStatesConnector can uniquely identify them.
+
+    Keep each hidden-state group's own page size. DeepSeek-V4 already uses the
+    packed multi-page-size layout, which can host these groups alongside MLA.
+    """
+    if not hidden_specs:
+        return groups
+    for name, spec in hidden_specs.items():
+        groups.append(KVCacheGroupSpec([name], spec))
+    return groups
+
+
+def _is_deepseek_v4_kv_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    """True for pure DeepSeek-V4 groups, or DeepSeek-V4 + extract_hidden_states."""
+    if not kv_cache_groups:
+        return False
+    if all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups
+    ):
+        return True
+    uniform = [
+        g
+        for g in kv_cache_groups
+        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+    ]
+    other = [
+        g
+        for g in kv_cache_groups
+        if not isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+    ]
+    return bool(uniform) and all(
+        isinstance(g.kv_cache_spec, HiddenStateCacheSpec) for g in other
+    )
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1710,57 +1750,53 @@ def get_kv_cache_groups(
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
+    # Isolate extract_hidden_states layers before any hybrid / DeepSeek-V4 MLA
+    # grouping. HiddenStateCacheSpec subclasses MLAAttentionSpec, so the
+    # DeepseekV4 branch would otherwise merge them into MLA groups and
+    # ExampleHiddenStatesConnector cannot find a unique hidden-states group
+    # ("MLA verifiers are unsupported").
+    hidden_specs = {
+        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
+    }
+    if hidden_specs:
+        kv_cache_spec = {
+            k: v
+            for k, v in kv_cache_spec.items()
+            if not isinstance(v, HiddenStateCacheSpec)
+        }
+
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns an empty list to allow for the KVCacheManager to handle
-        # attention free models.
-        return []
+        # attention free models (plus any isolated hidden-state groups below).
+        return _append_hidden_state_cache_groups([], hidden_specs)
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
-        return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        groups = _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        return _append_hidden_state_cache_groups(groups, hidden_specs)
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
-        return _get_kv_cache_groups_uniform_type(uniform_spec)
+        groups = _get_kv_cache_groups_uniform_type(uniform_spec)
+        return _append_hidden_state_cache_groups(groups, hidden_specs)
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
-        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
-        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
-        return kv_cache_groups
-
-    # Pull HiddenStateCacheSpec layers out before the general multi-group
-    # path so they don't affect page-size unification or grouping.
-    hidden_specs = {
-        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
-    }
-    filtered_spec = {
-        k: v
-        for k, v in kv_cache_spec.items()
-        if not isinstance(v, HiddenStateCacheSpec)
-    }
+        groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, groups)
+        return _append_hidden_state_cache_groups(groups, hidden_specs)
 
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+    filtered_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
-
-    # Add hidden-state layers back with page aligned to the common page.
-    if hidden_specs:
-        common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
-        for name, spec in hidden_specs.items():
-            per_token = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
-            new_bs = max(common_page // per_token, 1)
-            aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
-            groups.append(KVCacheGroupSpec([name], aligned))
-
-    return groups
+    return _append_hidden_state_cache_groups(groups, hidden_specs)
 
 
 def generate_scheduler_kv_cache_config(
@@ -1821,30 +1857,39 @@ def _max_memory_usage_bytes_from_groups(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
-    elif all(
-        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        for group in kv_cache_groups
-    ):
-        # Special case (only DeepseekV4 for now): all groups are
-        # UniformTypeKVCacheSpecs.
-        # They must already be page_size aligned and share a common padded
-        # layer-tuple layout. Even groups with fewer actual tuples still reserve
-        # the global number of tuple slots in the shared tensor layout.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+    elif _is_deepseek_v4_kv_groups(kv_cache_groups):
+        # Special case (DeepseekV4, optionally + extract_hidden_states groups):
+        # UniformTypeKVCacheSpecs groups share a padded layer-tuple layout.
+        # Isolated HiddenStateCacheSpec groups add their own memory on top.
+        uniform_groups = [
+            g
+            for g in kv_cache_groups
+            if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+        ]
+        hidden_groups = [
+            g
+            for g in kv_cache_groups
+            if isinstance(g.kv_cache_spec, HiddenStateCacheSpec)
+        ]
+        full_mla_spec = cast(UniformTypeKVCacheSpecs, uniform_groups[0].kv_cache_spec)
         layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
         num_layer_tuples = max(
             cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
-            for group in kv_cache_groups
+            for group in uniform_groups
         )
 
         total_max_mem_usage_bytes = 0
-        for group in kv_cache_groups:
+        for group in uniform_groups:
             group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
             g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
             g_max_mem_usage_page_bytes = (
                 num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
+        for group in hidden_groups:
+            total_max_mem_usage_bytes += group.kv_cache_spec.max_memory_usage_bytes(
+                vllm_config
+            )
         return total_max_mem_usage_bytes
 
     # General case: group_size pools, each shared by one layer per group
